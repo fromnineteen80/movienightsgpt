@@ -6,7 +6,6 @@
   <meta name="theme-color" content="#0b0c0f" />
   <title>MovieNightGPT</title>
   <style>
-    /* Dark mode. Always. No light theme. */
     html, body { height: 100%; }
     body {
       margin:0;
@@ -70,6 +69,7 @@
     .info { padding:10px 10px 12px; }
     .title { font-weight:900; font-size:13px; line-height:1.25; }
     .sub { margin-top:6px; font-size:12px; opacity:0.78; line-height:1.35; }
+    .card.disabled { opacity:0.55; filter:saturate(0.6); cursor:default; }
 
     .badge {
       position:absolute; top:10px; right:10px;
@@ -138,8 +138,21 @@
     .hint { font-size:12px; opacity:0.76; line-height:1.35; margin-top:8px; }
     .tiny { font-size:12px; opacity:0.66; margin-top:10px; }
 
-    a, a:visited { color: #f3f4f6; }
-    .linkBtn { text-decoration: underline; background: none; border: none; padding: 0; font: inherit; color: inherit; opacity: 0.85; }
+    .empty {
+      opacity:0.82;
+      font-size:12px;
+      padding:10px 2px 0;
+    }
+    .error {
+      margin-top:12px;
+      padding:12px;
+      border-radius:12px;
+      border:1px solid rgba(255,80,80,0.35);
+      background: rgba(255,0,0,0.10);
+      color:#ffd4d4;
+      white-space:pre-wrap;
+      font-size:12px;
+    }
   </style>
 </head>
 <body>
@@ -175,19 +188,17 @@
       <h2 style="margin:0 0 8px; font-size:14px;">Settings</h2>
 
       <div class="hint">
-        If you want personalized baseline rows and a Tonight override row, create a GitHub Gist with two files:
-        <b>picks.json</b> (baseline list) and <b>override.json</b> (Tonight row).
-        Paste their <b>raw URLs</b> here once. The MovieNightGPT Controller will update them for you.
+        Paste your GitHub Gist raw URLs here once. The MovieNightGPT Controller writes to those files.
       </div>
 
-      <label for="picksUrl">Baseline picks raw URL (picks.json)</label>
+      <label for="picksUrl">Picks raw URL (picks.json)</label>
       <input id="picksUrl" type="text" placeholder="https://gist.githubusercontent.com/USERNAME/GIST_ID/raw/picks.json" />
 
-      <label for="overrideUrl">Tonight override raw URL (override.json)</label>
+      <label for="overrideUrl">Tonight raw URL (override.json)</label>
       <input id="overrideUrl" type="text" placeholder="https://gist.githubusercontent.com/USERNAME/GIST_ID/raw/override.json" />
 
       <div class="hint">
-        If you leave these blank, you’ll see the public baseline.
+        Leave blank to use the public file in this repo: <b>data/today.json</b>
       </div>
 
       <div class="row">
@@ -195,66 +206,18 @@
         <button id="saveBtn" value="default">Save</button>
       </div>
 
-      <div class="tiny">
-        Tip: add this page to your iPhone home screen. It behaves like a simple app.
-      </div>
+      <div class="tiny">Tip: add this page to your iPhone home screen.</div>
     </form>
   </dialog>
 
   <script>
-    // Public fallback. Keep this in your repo if you want a shared baseline for people who never set up a Gist.
     const PUBLIC_BASELINE_URL = "./data/today.json";
+    const DEFAULT_ROW_TITLES = ["Recently Uploaded","Popular","Political","War","History"];
 
     const LS_PICKS_URL = "mn_picks_url";
     const LS_OVERRIDE_URL = "mn_override_url";
 
-// Watched filtering (local, per device). Used to avoid showing what you clicked recently.
-// Stores [{id: "YOUTUBE_ID", t: 1700000000000}] in localStorage.
-const LS_WATCHED = "mn_watched_v1";
-const WATCHED_HIDE_HOURS = 36; // "previous night" feel, but forgiving across timezones.
-
-function loadWatched() {
-  try {
-    const raw = localStorage.getItem(LS_WATCHED);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveWatched(arr) {
-  try { localStorage.setItem(LS_WATCHED, JSON.stringify(arr)); } catch {}
-}
-
-function pruneWatched(arr) {
-  const cutoff = Date.now() - (WATCHED_HIDE_HOURS * 60 * 60 * 1000) * 20; // keep a wider buffer for storage, but hide shorter
-  return arr.filter(x => x && typeof x.id === "string" && typeof x.t === "number" && x.t >= cutoff);
-}
-
-function markWatched(youtubeId) {
-  const id = (youtubeId || "").toString().trim();
-  if (!id) return;
-  const arr = pruneWatched(loadWatched());
-  // de-dupe
-  const without = arr.filter(x => x.id !== id);
-  without.unshift({ id, t: Date.now() });
-  // cap
-  saveWatched(without.slice(0, 250));
-}
-
-function isWatchedRecent(youtubeId) {
-  const id = (youtubeId || "").toString().trim();
-  if (!id) return false;
-  const cutoff = Date.now() - (WATCHED_HIDE_HOURS * 60 * 60 * 1000);
-  return pruneWatched(loadWatched()).some(x => x.id === id && x.t >= cutoff);
-}
-
-function isBadTitle(title) {
-  const t = (title || "").toString().toLowerCase();
-  return t.includes("documentary");
-}
-
+    let loadSeq = 0;
 
     const elMeta = document.getElementById("meta");
     const elContent = document.getElementById("content");
@@ -279,50 +242,102 @@ function isBadTitle(title) {
     }
     function safeText(s){ return (s ?? "").toString(); }
 
-    function getPicksUrl(){ return localStorage.getItem(LS_PICKS_URL) || ""; }
-    function getOverrideUrl(){ return localStorage.getItem(LS_OVERRIDE_URL) || ""; }
-    function setPicksUrl(v){ localStorage.setItem(LS_PICKS_URL, v); }
-    function setOverrideUrl(v){ localStorage.setItem(LS_OVERRIDE_URL, v); }
+        function lsGet(k){
+      try { return localStorage.getItem(k); } catch (_) { return null; }
+    }
+    function lsSet(k, v){
+      try { localStorage.setItem(k, v); } catch (_) {}
+    }
+
+    function getPicksUrl(){ return lsGet(LS_PICKS_URL) || ""; }
+    function getOverrideUrl(){ return lsGet(LS_OVERRIDE_URL) || ""; }
+    function setPicksUrl(v){ lsSet(LS_PICKS_URL, v); }
+    function setOverrideUrl(v){ lsSet(LS_OVERRIDE_URL, v); }
+
+function clearUrls(){
+      localStorage.removeItem(LS_PICKS_URL);
+      localStorage.removeItem(LS_OVERRIDE_URL);
+    }
+
+        const YT_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+    const PLACEHOLDER_POSTER = "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(`<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="400" height="600" viewBox="0 0 400 600"><rect width="400" height="600" fill="#151622"/><rect x="24" y="24" width="352" height="552" rx="18" fill="#0f1018" stroke="#2a2c3b"/><path d="M132 250h136v100H132z" fill="#1b1d2a" stroke="#2a2c3b"/><path d="M185 230l70 70-70 70z" fill="#2a2c3b"/><text x="200" y="430" text-anchor="middle" fill="#8c8fa3" font-family="-apple-system,system-ui,Segoe UI,Roboto" font-size="18">No poster</text></svg>`);
 
     function mkCard(m) {
-      const titleLine = `${safeText(m.title)} (${safeText(m.year)})`;
-      const director = m.director ? `Director: ${safeText(m.director)}` : "";
-      const leads = m.leads ? `Leads: ${safeText(m.leads)}` : "";
-      const awards = (m.awards && m.awards.length) ? m.awards.join(", ") : "";
-      const hasStar = !!(m.awards && m.awards.length);
+      const title = safeText(m.title);
+      const year = safeText(m.year);
+      const titleLine = `${title}${year ? ` (${year})` : ""}`;
+
+      const director = safeText(m.director);
+      const leads = Array.isArray(m.leads) ? m.leads.map(safeText) : (m.leads ? [safeText(m.leads)] : []);
+      const awardsArr = Array.isArray(m.awards) ? m.awards.map(safeText).filter(Boolean) : [];
+      const awardsText = awardsArr.join(", ");
+      const hasStar = awardsArr.length > 0;
+
+      const yt = safeText(m.youtubeId).trim();
+      const ytOk = YT_ID_RE.test(yt);
 
       const div = document.createElement("div");
-      div.className = "card";
-      div.dataset.yt = safeText(m.youtubeId);
+      div.className = "card" + (ytOk ? "" : " disabled");
+      if (ytOk) div.dataset.yt = yt;
       div.dataset.title = titleLine;
 
-      div.innerHTML = `
-        ${hasStar ? `<div class="badge"><div class="star">★</div><span>${awards}</span></div>` : ``}
-        <img class="poster" loading="lazy" alt="${titleLine}" src="${safeText(m.posterUrl)}" />
-        <div class="info">
-          <div class="title">${titleLine}</div>
-          <div class="sub">
-            ${director ? `<div>${director}</div>` : ``}
-            ${leads ? `<div>${leads}</div>` : ``}
-          </div>
-        </div>
-      `;
+      if (hasStar) {
+        const badge = document.createElement("div");
+        badge.className = "badge";
+        const star = document.createElement("div");
+        star.className = "star";
+        star.textContent = "★";
+        const span = document.createElement("span");
+        span.textContent = awardsText;
+        badge.appendChild(star);
+        badge.appendChild(span);
+        div.appendChild(badge);
+      }
+
+      const img = document.createElement("img");
+      img.className = "poster";
+      img.loading = "lazy";
+      img.alt = titleLine;
+
+      const posterUrl = safeText(m.posterUrl).trim();
+      img.src = posterUrl || PLACEHOLDER_POSTER;
+      img.onerror = () => { img.onerror = null; img.src = PLACEHOLDER_POSTER; };
+      div.appendChild(img);
+
+      const info = document.createElement("div");
+      info.className = "info";
+
+      const t = document.createElement("div");
+      t.className = "title";
+      t.textContent = titleLine;
+      info.appendChild(t);
+
+      if (director) {
+        const d = document.createElement("div");
+        d.className = "meta";
+        d.textContent = `Director: ${director}`;
+        info.appendChild(d);
+      }
+      if (leads.length) {
+        const l = document.createElement("div");
+        l.className = "meta";
+        l.textContent = `Leads: ${leads.join(", ")}`;
+        info.appendChild(l);
+      }
+
+      div.appendChild(info);
 
       div.addEventListener("click", () => {
-  const yt = div.dataset.yt;
-  if (!yt) return;
-  // mark as watched as soon as you click it (so it won't show tomorrow)
-  markWatched(yt);
-
-  nowTitle.textContent = div.dataset.title || "Now playing";
-  ytFrame.src = ytEmbedUrl(yt);
-  overlay.style.display = "block";
-  overlay.setAttribute("aria-hidden", "false");
-  document.body.style.overflow = "hidden";
-});
+        if (!ytOk) return;
+        ytFrame.src = ytEmbedUrl(yt);
+        overlay.style.display = "block";
+        overlay.setAttribute("aria-hidden", "false");
+        document.body.style.overflow = "hidden";
+      });
 
       return div;
     }
+
 
     function mkSection(title, items) {
       const section = document.createElement("section");
@@ -333,7 +348,7 @@ function isBadTitle(title) {
 
       const grid = document.createElement("div");
       grid.className = "grid";
-      items.forEach(m => grid.appendChild(mkCard(m)));
+      (items || []).forEach(m => grid.appendChild(mkCard(m)));
 
       section.appendChild(h2);
       section.appendChild(grid);
@@ -359,20 +374,23 @@ function isBadTitle(title) {
       e.preventDefault();
       picksUrlInput.value = "";
       overrideUrlInput.value = "";
+      clearUrls();
+      settingsDialog.close();
+      loadAll();
     });
 
     saveBtn.addEventListener("click", (e) => {
       e.preventDefault();
-      setPicksUrl(picksUrlInput.value.trim());
-      setOverrideUrl(overrideUrlInput.value.trim());
+      const p = picksUrlInput.value.trim();
+      const o = overrideUrlInput.value.trim();
+      if (p) setPicksUrl(p); else localStorage.removeItem(LS_PICKS_URL);
+      if (o) setOverrideUrl(o); else localStorage.removeItem(LS_OVERRIDE_URL);
       settingsDialog.close();
       loadAll();
     });
 
     refreshBtn.addEventListener("click", () => loadAll());
 
-    // "More automatic" button. Opens ChatGPT with a prefilled prompt.
-    // You can edit these prompts freely.
     chatBtn.addEventListener("click", () => {
       const picks = getPicksUrl();
       const override = getOverrideUrl();
@@ -380,24 +398,19 @@ function isBadTitle(title) {
         `Use MovieNightGPT Controller.\n\n` +
         `My picks.json raw URL: ${picks || "[not set]"}\n` +
         `My override.json raw URL: ${override || "[not set]"}\n\n` +
-        `1) If baseline is not set, ask me for my baseline tastes and generate baseline picks.\n` +
-        `2) If I say "Tonight: ...", generate tonight override picks.\n`;
+        `If my tastes are not set, ask me for my favorite genres. Then write picks.json.\n` +
+        `If I ask what to watch tonight, write override.json.\n`;
       const url = "https://chat.openai.com/?q=" + encodeURIComponent(msg);
       window.open(url, "_blank", "noopener,noreferrer");
     });
 
     async function fetchJson(url) {
       const r = await fetch(url, { cache: "no-store" });
-      if (!r.ok) throw new Error(`Fetch failed`);
-      return await r.json();
-    }
-
-    function splitIntoRows(items, rowSize, maxRows) {
-      const rows = [];
-      for (let i = 0; i < items.length && rows.length < maxRows; i += rowSize) {
-        rows.push(items.slice(i, i + rowSize));
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        throw new Error(`Fetch ${r.status} ${r.statusText}: ${url}${t ? `\n${t.slice(0,200)}` : ""}`);
       }
-      return rows;
+      return await r.json();
     }
 
     function isOverrideValid(o) {
@@ -411,68 +424,75 @@ function isBadTitle(title) {
     async function loadBaseline() {
       const picksUrl = getPicksUrl();
       if (picksUrl) {
-        try {
-          return await fetchJson(picksUrl);
-        } catch (e) {
-          // fall through to public
-        }
+        try { return await fetchJson(picksUrl); } catch (e) { /* fall through */ }
       }
       return await fetchJson(PUBLIC_BASELINE_URL);
     }
 
+    function renderError(msg) {
+      const box = document.createElement("div");
+      box.className = "error";
+      box.textContent = msg;
+      elContent.appendChild(box);
+    }
+
     async function loadAll() {
+      const seq = ++loadSeq;
       elMeta.textContent = "Loading…";
       elContent.innerHTML = "";
 
       let baseline;
       try {
         baseline = await loadBaseline();
+        if (seq !== loadSeq) return;
       } catch (err) {
-        elMeta.textContent = "Could not load picks";
-        elContent.innerHTML = `<div style="opacity:.85;padding:12px;">Try Settings.</div>`;
+        elMeta.textContent = "Could not load";
+        renderError(err && err.message ? err.message : "Unknown error");
+        elContent.appendChild(Object.assign(document.createElement("div"), { className: "empty", textContent: "Open Settings and paste your Gist raw URLs." }));
         return;
       }
 
       const dateStr = baseline.date ? baseline.date : "";
-      const criteriaStr = baseline.criteria ? baseline.criteria : "Baseline";
-      elMeta.textContent = [dateStr, criteriaStr].filter(Boolean).join(" · ");
+      const criteriaStr = baseline.criteria ? baseline.criteria : "";
+      elMeta.textContent = [dateStr, criteriaStr].filter(Boolean).join(" · ") || "";
 
       // Tonight row (optional)
       const overrideUrl = getOverrideUrl();
       if (overrideUrl) {
         try {
           const o = await fetchJson(overrideUrl);
+          if (seq !== loadSeq) return;
           if (isOverrideValid(o) && Array.isArray(o.items) && o.items.length) {
-            const row = o.items
-              .filter(m => m && !isBadTitle(m.title) && !isWatchedRecent(m.youtubeId))
-              .slice(0, 4);
-            elContent.appendChild(mkSection(o.title || "Tonight", row));
+            elContent.appendChild(mkSection(o.title || "Tonight", o.items.slice(0,4)));
           }
         } catch (e) {
-          // silent fail
+          // silent
         }
       }
 
-      // Baseline 3 rows of 4
-      const items = (Array.isArray(baseline.items) ? baseline.items : [])
-        .filter(m => m && !isBadTitle(m.title) && !isWatchedRecent(m.youtubeId));
-      const rowTitles = Array.isArray(baseline.row_titles) ? baseline.row_titles : ["Plan 1","Plan 2","Plan 3"];
-      const maxRows = Array.isArray(rowTitles) ? rowTitles.length : 3;
-      const rows = splitIntoRows(items, 4, maxRows);
+      const items = Array.isArray(baseline.items) ? baseline.items : [];
+      const rowTitles = Array.isArray(baseline.row_titles) && baseline.row_titles.length
+        ? baseline.row_titles
+        : DEFAULT_ROW_TITLES;
 
-      for (let i = 0; i < rows.length; i++) {
-        elContent.appendChild(mkSection(rowTitles[i] || `Plan ${i+1}`, rows[i]));
+      // Always render all row titles (5 rows), even if empty.
+      for (let i = 0; i < rowTitles.length; i++) {
+        const start = i * 4;
+        const rowItems = items.slice(start, start + 4);
+        elContent.appendChild(mkSection(rowTitles[i] || `Row ${i+1}`, rowItems));
       }
 
       if (!items.length) {
-        const note = document.createElement("div");
-        note.style.opacity = "0.75";
-        note.style.fontSize = "12px";
-        note.style.padding = "10px 2px 0";
-        note.textContent = "No baseline picks yet. Use Chat to tell the Controller your baseline, and it will write picks.json.";
-        elContent.appendChild(note);
+        elContent.appendChild(Object.assign(document.createElement("div"), { className: "empty", textContent: "No movies yet. Use Chat to tell the Controller what you like, then it will write picks.json." }));
       }
     }
+
+    window.addEventListener("error", (e) => {
+      try {
+        elMeta.textContent = "Error";
+        if (!elContent.innerHTML) renderError(e.message || "Script error");
+      } catch (_) {}
+    });
 
     loadAll();
   </script>
