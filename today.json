@@ -1,6 +1,12 @@
 {
   "date": "Public",
   "criteria": "Default baseline",
-  "row_titles": ["Plan 1", "Plan 2", "Plan 3"],
+  "row_titles": [
+    "Recently Uploaded",
+    "Popular",
+    "Political",
+    "War",
+    "History"
+  ],
   "items": []
 }
